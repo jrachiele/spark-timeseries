@@ -3,7 +3,6 @@
  *
  * Cloudera, Inc. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"). You may not use this file except in
- * Version 2.0 (the "License"). You may not use this file except in
  * compliance with the License. You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
@@ -51,7 +50,7 @@ class TimeSeriesStatisticalTestsSuite extends FunSuite with ShouldMatchers {
     bgtest(new DenseVector(resids2), new DenseMatrix(x.length, 1, x), 1)._2 should be < pthreshold
     bgtest(new DenseVector(resids2), new DenseMatrix(x.length, 1, x), 4)._2 should be < pthreshold
   }
-  
+
   test("breusch-pagan") {
     // Replicating the example provided by R package lmtest for bptest
     val rand = new MersenneTwister(5L)

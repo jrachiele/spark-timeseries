@@ -1,4 +1,4 @@
-/*
+/**
  * Copyright (c) 2015, Cloudera, Inc. All Rights Reserved.
  *
  * Cloudera, Inc. licenses this file to you under the Apache License,
@@ -24,16 +24,16 @@ trait LocalSparkContext extends BeforeAndAfterEach with BeforeAndAfterAll { self
 
   @transient var sc: SparkContext = _
 
-  override def beforeAll() {
+  override def beforeAll(): Unit = {
     super.beforeAll()
   }
 
-  override def afterEach() {
+  override def afterEach(): Unit = {
     resetSparkContext()
     super.afterEach()
   }
 
-  def resetSparkContext() = {
+  def resetSparkContext(): Unit = {
     LocalSparkContext.stop(sc)
     sc = null
   }
@@ -41,7 +41,7 @@ trait LocalSparkContext extends BeforeAndAfterEach with BeforeAndAfterAll { self
 }
 
 object LocalSparkContext {
-  def stop(sc: SparkContext) {
+  def stop(sc: SparkContext): Unit = {
     if (sc != null) {
       sc.stop()
     }
@@ -50,7 +50,7 @@ object LocalSparkContext {
   }
 
   /** Runs `f` by passing in `sc` and ensures that `sc` is stopped. */
-  def withSpark[T](sc: SparkContext)(f: SparkContext => T) = {
+  def withSpark[T](sc: SparkContext)(f: SparkContext => T): Unit = {
     try {
       f(sc)
     } finally {

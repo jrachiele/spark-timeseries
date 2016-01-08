@@ -1,3 +1,18 @@
+/**
+ * Copyright (c) 2015, Cloudera, Inc. All Rights Reserved.
+ *
+ * Cloudera, Inc. licenses this file to you under the Apache License,
+ * Version 2.0 (the "License"). You may not use this file except in
+ * compliance with the License. You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+ * CONDITIONS OF ANY KIND, either express or implied. See the License for
+ * the specific language governing permissions and limitations under the
+ * License.
+ */
+
 package com.cloudera.sparkts.api.java;
 
 import com.cloudera.sparkts.*;
@@ -9,10 +24,11 @@ import org.apache.spark.mllib.linalg.Vector;
 import scala.Tuple3;
 import scala.reflect.ClassTag$;
 
-import java.lang.reflect.Array;
-
 public final class JavaTimeSeriesRDDFactory {
     private static final JavaTimeSeriesRDD$ JAVA_TIME_SERIES_RDD = JavaTimeSeriesRDD$.MODULE$;
+
+    private JavaTimeSeriesRDDFactory() {
+    }
 
     /**
      * Instantiates a JavaTimeSeriesRDD.
@@ -53,10 +69,12 @@ public final class JavaTimeSeriesRDDFactory {
     public static <K> JavaTimeSeriesRDD<K> javaTimeSeriesRDD(
         DateTimeIndex targetIndex,
         JavaRDD<JavaTimeSeries<K>> seriesRDD) {
+        @SuppressWarnings("unchecked")
+        K[] keys = (K[]) seriesRDD.first().keys();
         return JAVA_TIME_SERIES_RDD.javaTimeSeriesRDD(
                 targetIndex,
                 seriesRDD,
-                ClassTag$.MODULE$.<K>apply(((K[]) seriesRDD.first().keys())[0].getClass()));
+                ClassTag$.MODULE$.<K>apply(keys[0].getClass()));
     }
 
     /**
@@ -85,7 +103,8 @@ public final class JavaTimeSeriesRDDFactory {
     /**
      * Loads a JavaTimeSeriesRDD from a directory containing a set of CSV files and a date-time index.
      */
-    public static JavaTimeSeriesRDD<String> javaTimeSeriesRDDFromCsv(String path, JavaSparkContext sc) {
+    public static JavaTimeSeriesRDD<String> javaTimeSeriesRDDFromCsv(
+            String path, JavaSparkContext sc) {
         return JAVA_TIME_SERIES_RDD.javaTimeSeriesRDDFromCsv(path, sc);
     }
 

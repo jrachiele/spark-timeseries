@@ -15,11 +15,13 @@
 
 package com.cloudera.sparkts
 
-import java.util.{Comparators, Comparator}
+import java.time._
+import java.util.Arrays
 
 import org.threeten.extra._
+import scala.annotation.tailrec
 import scala.language.implicitConversions
-import java.time._
+
 import com.cloudera.sparkts.DateTimeIndex._
 import com.cloudera.sparkts.TimeSeriesUtils._
 
@@ -98,21 +100,31 @@ trait DateTimeIndex extends Serializable {
   def locAtDateTime(dt: ZonedDateTime): Int
 
   /**
-   * The location of the given date-time, as milliseconds since the epoch. If the index contains the
+   * The location of the given date-time, as nanoseconds since the epoch. If the index contains the
    * date-time more than once, returns its first appearance. If the given date-time does not appear
    * in the index, returns -1.
    */
   def locAtDateTime(dt: Long): Int
 
   /**
-   * Returns the contents of the DateTimeIndex as an array of millisecond values from the epoch.
+   * Returns the contents of the DateTimeIndex as an array of nanosecond values from the epoch.
    */
-  def toMillisArray(): Array[Long]
+  def toNanosArray(): Array[Long]
 
   /**
     * Returns the contents of the DateTimeIndex as an array of ZonedDateTime
     */
   def toZonedDateTimeArray(): Array[ZonedDateTime]
+
+  /**
+   * Returns an iterator over the contents of the DateTimeIndex as nanosecond values from the epoch.
+   */
+  def nanosIterator(): Iterator[Long]
+
+  /**
+   * Returns an iterator over the contents of the DateTimeIndex as ZonedDateTime
+   */
+  def zonedDateTimeIterator(): Iterator[ZonedDateTime]
 }
 
 /**
@@ -172,10 +184,10 @@ class UniformDateTimeIndex(
     locAtDateTime(longToZonedDateTime(dt, dateTimeZone))
   }
 
-  override def toMillisArray(): Array[Long] = {
+  override def toNanosArray(): Array[Long] = {
     val arr = new Array[Long](periods)
     for (i <- 0 until periods) {
-      arr(i) = zonedDateTimeToLong(dateTimeAtLoc(i)) / 1000000L
+      arr(i) = zonedDateTimeToLong(dateTimeAtLoc(i))
     }
     arr
   }
@@ -193,10 +205,22 @@ class UniformDateTimeIndex(
     otherIndex.first == first && otherIndex.periods == periods && otherIndex.frequency == frequency
   }
 
+  override def hashCode(): Int = {
+    first.hashCode() ^ periods ^ frequency.hashCode()
+  }
+
   override def toString: String = {
     Array(
       "uniform", dateTimeZone.toString, start.toString,
       periods.toString, frequency.toString).mkString(",")
+  }
+
+  override def nanosIterator(): Iterator[Long] = {
+    zonedDateTimeIterator.map(zonedDateTimeToLong(_))
+  }
+
+  override def zonedDateTimeIterator(): Iterator[ZonedDateTime] = {
+    (0 until periods).view.map(frequency.advance(start, _)).iterator
   }
 }
 
@@ -234,13 +258,15 @@ class IrregularDateTimeIndex(
 
   override def first: ZonedDateTime = longToZonedDateTime(instants(0), dateTimeZone)
 
-  override def last: ZonedDateTime = longToZonedDateTime(instants(instants.length - 1), dateTimeZone)
+  override def last: ZonedDateTime =
+    longToZonedDateTime(instants(instants.length - 1), dateTimeZone)
 
   override def zone: ZoneId = dateTimeZone
 
   override def size: Int = instants.length
 
-  override def dateTimeAtLoc(loc: Int): ZonedDateTime = longToZonedDateTime(instants(loc), dateTimeZone)
+  override def dateTimeAtLoc(loc: Int): ZonedDateTime =
+    longToZonedDateTime(instants(loc), dateTimeZone)
 
   override def locAtDateTime(dt: ZonedDateTime): Int = {
     val loc = java.util.Arrays.binarySearch(instants, zonedDateTimeToLong(dt))
@@ -252,8 +278,8 @@ class IrregularDateTimeIndex(
     if (loc < 0) -1 else loc
   }
 
-  override def toMillisArray(): Array[Long] = {
-    instants.map(dt => dt / 1000000L)
+  override def toNanosArray(): Array[Long] = {
+    instants
   }
 
   override def toZonedDateTimeArray(): Array[ZonedDateTime] = {
@@ -265,15 +291,225 @@ class IrregularDateTimeIndex(
     otherIndex.instants.sameElements(instants)
   }
 
+  override def hashCode(): Int = {
+    Arrays.hashCode(instants)
+  }
+
   override def toString: String = {
     "irregular," + dateTimeZone.toString + "," +
       instants.map(longToZonedDateTime(_, dateTimeZone).toString).mkString(",")
+  }
+
+  override def nanosIterator(): Iterator[Long] = {
+    instants.iterator
+  }
+
+  override def zonedDateTimeIterator(): Iterator[ZonedDateTime] = {
+    instants.iterator.map(longToZonedDateTime(_, dateTimeZone))
+  }
+}
+
+/**
+ * An implementation of DateTimeIndex that holds a hybrid collection of DateTimeIndex
+ * implementations.
+ *
+ * Indices are assumed to be sorted and disjoint such that
+ * for any two consecutive indices i and j: i.last < j.first
+ *
+ */
+class HybridDateTimeIndex(
+    val indices: Array[DateTimeIndex],
+    val dateTimeZone: ZoneId = ZoneId.systemDefault())
+  extends DateTimeIndex {
+
+  private val sizeOnLeft: Array[Int] = {
+    indices.init.scanLeft(0)(_ + _.size)
+  }
+
+  override def slice(interval: Interval): HybridDateTimeIndex = {
+    slice(ZonedDateTime.ofInstant(interval.getStart, dateTimeZone),
+      ZonedDateTime.ofInstant(interval.getEnd, dateTimeZone))
+  }
+
+  override def slice(start: ZonedDateTime, end: ZonedDateTime): HybridDateTimeIndex = {
+    require(start.isBefore(end), s"start($start) should be less than end($end)")
+
+    val startIndex = binarySearch(0, indices.length - 1, start)
+    val endIndex = binarySearch(0, indices.length - 1, end)
+
+    val newIndices =
+      if (startIndex == endIndex) {
+        Array(indices(startIndex).slice(start, end))
+      } else {
+        val startDateTimeIndex = indices(startIndex)
+        val endDateTimeIndex = indices(endIndex)
+
+        val startSlice = Array(startDateTimeIndex.slice(start, startDateTimeIndex.last))
+        val endSlice = Array(endDateTimeIndex.slice(endDateTimeIndex.first, end))
+
+        if (endIndex - startIndex == 1) {
+          startSlice ++ endSlice
+        } else {
+          startSlice ++ indices.slice(startIndex + 1, endIndex) ++ endSlice
+        }
+      }
+
+    new HybridDateTimeIndex(newIndices, dateTimeZone)
+  }
+
+  override def slice(start: Long, end: Long): HybridDateTimeIndex = {
+    slice(longToZonedDateTime(start, dateTimeZone),
+      longToZonedDateTime(end, dateTimeZone))
+  }
+
+  override def islice(range: Range): HybridDateTimeIndex = {
+    islice(range.head, range.last + 1)
+  }
+
+  override def islice(start: Int, end: Int): HybridDateTimeIndex = {
+    require(start < end, s"start($start) should be less than end($end)")
+
+    val startIndex = binarySearch(0, indices.length - 1, start)
+    val endIndex = binarySearch(0, indices.length - 1, end)
+
+    val alignedStart = start - sizeOnLeft(startIndex)
+    val alignedEnd = end - sizeOnLeft(endIndex)
+
+    val newIndices =
+      if (startIndex == endIndex) {
+        Array(indices(startIndex).islice(alignedStart, alignedEnd))
+      } else {
+        val startDateTimeIndex = indices(startIndex)
+        val endDateTimeIndex = indices(endIndex)
+
+        val startSlice = Array(startDateTimeIndex.islice(alignedStart, startDateTimeIndex.size))
+        val endSlice = Array(endDateTimeIndex.islice(0, alignedEnd))
+
+        if (endIndex - startIndex == 1) {
+          startSlice ++ endSlice
+        } else {
+          startSlice ++ indices.slice(startIndex + 1, endIndex) ++ endSlice
+        }
+      }
+
+    new HybridDateTimeIndex(newIndices, dateTimeZone)
+  }
+
+  override def first: ZonedDateTime = indices(0).first.withZoneSameInstant(dateTimeZone)
+
+  override def last: ZonedDateTime = indices(indices.length - 1).last
+    .withZoneSameInstant(dateTimeZone)
+
+  override def zone: ZoneId = dateTimeZone
+
+  override def size: Int = indices.map(_.size).sum
+
+  override def dateTimeAtLoc(loc: Int): ZonedDateTime = {
+    val i = binarySearch(0, indices.length - 1, loc)
+    if (i < 0) {
+      throw new ArrayIndexOutOfBoundsException(s"no dateTime at loc $loc")
+    }
+    indices(i).dateTimeAtLoc(loc - sizeOnLeft(i))
+  }
+
+  @tailrec
+  private def binarySearch(low: Int, high: Int, i: Int): Int = {
+    if (low <= high) {
+      val mid = (low + high) >>> 1
+      val midIndex = indices(mid)
+      val sizeOnLeftOfMid = sizeOnLeft(mid)
+      if (i < sizeOnLeftOfMid) {
+        binarySearch(low, mid - 1, i)
+      } else if (i >= sizeOnLeftOfMid + midIndex.size) {
+        binarySearch(mid + 1, high, i)
+      } else {
+        mid
+      }
+    } else {
+      -1
+    }
+  }
+
+  override def locAtDateTime(dt: ZonedDateTime): Int = {
+    val i = binarySearch(0, indices.length - 1, dt)
+    if (i < 0) {
+      -1
+    } else {
+      val loc = indices(i).locAtDateTime(dt)
+      if (loc >= 0) {
+        sizeOnLeft(i) + loc
+      } else {
+        -1
+      }
+    }
+  }
+
+  override def locAtDateTime(dt: Long): Int =
+    locAtDateTime(longToZonedDateTime(dt, dateTimeZone))
+
+  @tailrec
+  private def binarySearch(low: Int, high: Int, dt: ZonedDateTime): Int = {
+    if (low <= high) {
+      val mid = (low + high) >>> 1
+      val midIndex = indices(mid)
+      if (dt.isBefore(midIndex.first)) {
+        binarySearch(low, mid - 1, dt)
+      } else if (dt.isAfter(midIndex.last)) {
+        binarySearch(mid + 1, high, dt)
+      } else {
+        mid
+      }
+    } else {
+      -1
+    }
+  }
+
+  override def toNanosArray(): Array[Long] = {
+    indices.flatMap(_.toNanosArray)
+  }
+
+  override def toZonedDateTimeArray(): Array[ZonedDateTime] = {
+    indices.flatMap(_.toZonedDateTimeArray)
+  }
+
+  override def equals(other: Any): Boolean = {
+    val otherIndex = other.asInstanceOf[HybridDateTimeIndex]
+    otherIndex.indices.sameElements(indices)
+  }
+
+  override def hashCode(): Int = {
+    Arrays.hashCode(indices.asInstanceOf[Array[AnyRef]])
+  }
+
+  override def toString: String = {
+    "hybrid," + dateTimeZone.toString + "," +
+      indices.map(_.toString).mkString(";")
+  }
+
+  override def nanosIterator(): Iterator[Long] = {
+    indices.foldLeft(Iterator[Long]())(_ ++ _.nanosIterator)
+  }
+
+  override def zonedDateTimeIterator(): Iterator[ZonedDateTime] = {
+    indices.foldLeft(Iterator[ZonedDateTime]())(_ ++ _.zonedDateTimeIterator)
   }
 }
 
 object DateTimeIndex {
   /**
-   * Create a UniformDateTimeIndex with the given start time, number of periods, frequency,
+   * Creates a UniformDateTimeIndex with the given start time, number of periods, frequency,
+   * and time zone(optionally)
+   */
+  def uniform(
+      start: Long,
+      periods: Int,
+      frequency: Frequency): UniformDateTimeIndex = {
+    val zone = ZoneId.systemDefault()
+    new UniformDateTimeIndex(longToZonedDateTime(start, zone), periods, frequency)
+  }
+
+  /**
+   * Creates a UniformDateTimeIndex with the given start time, number of periods, frequency,
    * and time zone(optionally)
    */
   def uniform(
@@ -281,12 +517,12 @@ object DateTimeIndex {
       periods: Int,
       frequency: Frequency,
       zone: ZoneId = ZoneId.systemDefault()): UniformDateTimeIndex = {
-
     new UniformDateTimeIndex(longToZonedDateTime(start, zone), periods, frequency)
   }
 
+
   /**
-   * Create a UniformDateTimeIndex with the given start time, number of periods, and frequency
+   * Creates a UniformDateTimeIndex with the given start time, number of periods, and frequency
    * using the time zone of start time.
    */
   def uniform(start: ZonedDateTime, periods: Int, frequency: Frequency): UniformDateTimeIndex = {
@@ -294,7 +530,7 @@ object DateTimeIndex {
   }
 
   /**
-   * Create a UniformDateTimeIndex with the given start time, number of periods, frequency
+   * Creates a UniformDateTimeIndex with the given start time, number of periods, frequency
    * , and time zone
    */
   def uniform(start: ZonedDateTime, periods: Int, frequency: Frequency, zone: ZoneId)
@@ -303,68 +539,50 @@ object DateTimeIndex {
   }
 
   /**
-    * Create a UniformDateTimeIndex with the given start time and end time (inclusive) and frequency.
-    */
-  def uniform(start: ZonedDateTime, end: ZonedDateTime, frequency: Frequency)
-    : UniformDateTimeIndex = {
-    val tz = ZoneId.systemDefault()
-    uniform(start, frequency.difference(start, end) + 1, frequency, tz)
-  }
-
-  /**
-    * Create a UniformDateTimeIndex with the given start time and end time (inclusive), frequency
-    * and time zone.
-    */
-  def uniform(start: ZonedDateTime, end: ZonedDateTime, frequency: Frequency, tz: ZoneId)
-    : UniformDateTimeIndex = {
-    uniform(start, frequency.difference(start, end) + 1, frequency, tz)
-  }
-
-  /**
-   * Create a UniformDateTimeIndex with the given start time and end time (inclusive) and frequency.
+   * Creates a UniformDateTimeIndex with the given start time and end time (inclusive)
+   * and frequency.
    */
-  def uniform(start: Long, end: Long, frequency: Frequency): UniformDateTimeIndex = {
+  def uniformFromInterval(start: Long, end: Long, frequency: Frequency): UniformDateTimeIndex = {
     val tz = ZoneId.systemDefault()
     uniform(start, frequency.difference(longToZonedDateTime(start, tz),
       longToZonedDateTime(end, tz)) + 1, frequency, tz)
   }
 
   /**
-    * Create a UniformDateTimeIndex with the given start time and end time (inclusive), frequency
+    * Creates a UniformDateTimeIndex with the given start time and end time (inclusive), frequency
     * and time zone.
     */
-  def uniform(start: Long, end: Long, frequency: Frequency, tz: ZoneId): UniformDateTimeIndex = {
+  def uniformFromInterval(start: Long, end: Long, frequency: Frequency, tz: ZoneId)
+    : UniformDateTimeIndex = {
     uniform(start, frequency.difference(longToZonedDateTime(start, tz),
       longToZonedDateTime(end, tz)) + 1, frequency, tz)
   }
 
   /**
-   * Create a UniformDateTimeIndex with the given start time and end time (inclusive) and frequency.
-   */
-  def uniformFromInterval(start: Long, end: Long, frequency: Frequency, zone: ZoneId): UniformDateTimeIndex = {
-    uniform(start, frequency.difference(longToZonedDateTime(start, zone),
-      longToZonedDateTime(end, zone)) + 1, frequency, zone)
-  }
-
-  /**
-   * Create a UniformDateTimeIndex with the given start time and end time (inclusive) and frequency
+   * Creates a UniformDateTimeIndex with the given start time and end time (inclusive) and frequency
    * using the time zone of start time.
    */
-  def uniformFromInterval(start: ZonedDateTime, end: ZonedDateTime, frequency: Frequency): UniformDateTimeIndex = {
+  def uniformFromInterval(
+      start: ZonedDateTime,
+      end: ZonedDateTime,
+      frequency: Frequency): UniformDateTimeIndex = {
     uniform(start, frequency.difference(start, end) + 1, frequency)
   }
 
   /**
-   * Create a UniformDateTimeIndex with the given start time and end time (inclusive) and frequency
+   * Creates a UniformDateTimeIndex with the given start time and end time (inclusive) and frequency
    * and time zone.
    */
-  def uniformFromInterval(start: ZonedDateTime, end: ZonedDateTime, frequency: Frequency, zone: ZoneId)
-    : UniformDateTimeIndex = {
+  def uniformFromInterval(
+      start: ZonedDateTime,
+      end: ZonedDateTime,
+      frequency: Frequency,
+      zone: ZoneId): UniformDateTimeIndex = {
     uniform(start, frequency.difference(start, end) + 1, frequency, zone)
   }
 
   /**
-   * Create an IrregularDateTimeIndex composed of the given date-times using the time zone
+   * Creates an IrregularDateTimeIndex composed of the given date-times using the time zone
    * of the first date-time in dts array.
    */
   def irregular(dts: Array[ZonedDateTime]): IrregularDateTimeIndex = {
@@ -372,14 +590,14 @@ object DateTimeIndex {
   }
 
   /**
-   * Create an IrregularDateTimeIndex composed of the given date-times and zone
+   * Creates an IrregularDateTimeIndex composed of the given date-times and zone
    */
   def irregular(dts: Array[ZonedDateTime], zone: ZoneId): IrregularDateTimeIndex = {
     new IrregularDateTimeIndex(dts.map(zdt => zonedDateTimeToLong(zdt)), zone)
   }
 
   /**
-   * Create an IrregularDateTimeIndex composed of the given date-times, as millis from the epoch
+   * Creates an IrregularDateTimeIndex composed of the given date-times, as nanos from the epoch
    * using the default date-time zone.
    */
   def irregular(dts: Array[Long]): IrregularDateTimeIndex = {
@@ -387,11 +605,21 @@ object DateTimeIndex {
   }
 
   /**
-   * Create an IrregularDateTimeIndex composed of the given date-times, as millis from the epoch
+   * Creates an IrregularDateTimeIndex composed of the given date-times, as nanos from the epoch
    * using the provided date-time zone.
    */
   def irregular(dts: Array[Long], zone: ZoneId): IrregularDateTimeIndex = {
     new IrregularDateTimeIndex(dts, zone)
+  }
+
+  /**
+   * Creates a HybridDateTimeIndex composed of the given indices.
+   * All indices should have the same zone.
+   */
+  def hybrid(indices: Array[DateTimeIndex]): HybridDateTimeIndex = {
+    val zone = indices.head.zone
+    require(indices.forall(_.zone.equals(zone)), "All indices should have the same zone")
+    new HybridDateTimeIndex(indices, zone)
   }
 
   /**
@@ -422,7 +650,9 @@ object DateTimeIndex {
    * @param dayOfWeek the ISO index of the day of week
    * @return the day of week index aligned w.r.t the first day of week
    */
-  def rebaseDayOfWeek(dayOfWeek: Int, firstDayOfWeek: Int = DayOfWeek.MONDAY.getValue): Int = {
+  private[sparkts] def rebaseDayOfWeek(
+      dayOfWeek: Int,
+      firstDayOfWeek: Int = DayOfWeek.MONDAY.getValue): Int = {
     (dayOfWeek - firstDayOfWeek + DayOfWeek.MONDAY.getValue +
       DayOfWeek.values.length - 1) % DayOfWeek.values.length + 1
   }
@@ -430,7 +660,9 @@ object DateTimeIndex {
   /**
    * Finds the next business day occurring at or after the given date-time.
    */
-  def nextBusinessDay(dt: ZonedDateTime, firstDayOfWeek: Int = DayOfWeek.MONDAY.getValue): ZonedDateTime = {
+  private[sparkts] def nextBusinessDay(
+      dt: ZonedDateTime,
+      firstDayOfWeek: Int = DayOfWeek.MONDAY.getValue): ZonedDateTime = {
     val rebasedDayOfWeek = rebaseDayOfWeek(dt.getDayOfWeek.getValue)
     if (rebasedDayOfWeek == 6) {
       dt.plusDays(2)
@@ -442,15 +674,16 @@ object DateTimeIndex {
   }
 
   implicit def periodToFrequency(period: Period): Frequency = {
-    if (period.getDays != 0) {
-      return new DayFrequency(period.getDays)
+    if (period.getDays == 0) {
+      throw new UnsupportedOperationException()
     }
-    throw new UnsupportedOperationException()
+    new DayFrequency(period.getDays)
   }
 
   implicit def intToBusinessDayRichInt(n: Int) : BusinessDayRichInt = new BusinessDayRichInt(n)
 
-  implicit def intToBusinessDayRichInt(tuple: (Int, Int)) : BusinessDayRichInt = new BusinessDayRichInt(tuple._1, tuple._2)
+  implicit def intToBusinessDayRichInt(tuple: (Int, Int)) : BusinessDayRichInt =
+    new BusinessDayRichInt(tuple._1, tuple._2)
 
   /**
    * Parses a DateTimeIndex from the output of its toString method
@@ -475,6 +708,10 @@ object DateTimeIndex {
           dts(i - 2) = ZonedDateTime.parse(tokens(i))
         }
         irregular(dts, zone)
+      case "hybrid" =>
+        val zone = ZoneId.of(tokens(1))
+        val indices = str.split(",", 3).last.split(";").map(fromString)
+        new HybridDateTimeIndex(indices, zone)
       case _ => throw new IllegalArgumentException(
         s"DateTimeIndex type ${tokens(0)} not recognized")
     }

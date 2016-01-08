@@ -66,9 +66,6 @@ object ARIMA {
    *                       (default), initialized using Hannan-Rissanen algorithm. If provided,
    *                       order of parameter should be: intercept term, AR parameters (in
    *                       increasing order of lag), MA parameters (in increasing order of lag)
-   *
-   *
-   * @return
    */
   def fitModel(
       p: Int,
@@ -91,7 +88,7 @@ object ARIMA {
 
     // Initial parameter guesses if none provided by user
     val initParams = if (userInitParams == null) {
-      HannanRissanenInit(p, q, diffedTs, includeIntercept)
+      hannanRissanenInit(p, q, diffedTs, includeIntercept)
     } else {
       userInitParams
     }
@@ -204,7 +201,7 @@ object ARIMA {
    * @param includeIntercept flag to include intercept
    * @return initial ARMA(p, d, q) parameter estimates
    */
-  private def HannanRissanenInit(
+  private def hannanRissanenInit(
       p: Int,
       q: Int,
       y: Array[Double],
@@ -468,7 +465,6 @@ class ARIMAModel(
    * To do so, we assume prior MA terms are 0.0, and prior AR are equal to the model's intercept or
    * 0.0 if fit without an intercept
    * @param ts Time series of observations with this model's characteristics.
-   * @param destTs
    * @return The dest series, representing remaining errors, for convenience.
    */
   def removeTimeDependentEffects(ts: Vector[Double], destTs: Vector[Double]): Vector[Double] = {
@@ -491,7 +487,6 @@ class ARIMAModel(
    * We assume that prior MA terms are 0.0 and prior AR terms are equal to the intercept or 0.0 if
    * fit without an intercept
    * @param ts Time series of i.i.d. observations.
-   * @param destTs
    * @return The dest series, representing the application of the model to provided error
    *         terms, for convenience.
    */

@@ -3,13 +3,15 @@
 spark-ts
 =============
 
-A Scala / Python library for interacting with time series data on Apache Spark.
+A Scala / Java / Python library for interacting with time series data on Apache Spark.
 
 Docs are available at http://cloudera.github.io/spark-timeseries.
 
-Scaladoc is available at http://cloudera.github.io/spark-timeseries/0.1.0/scaladocs/index.html.
+Scaladoc is available at http://cloudera.github.io/spark-timeseries/0.2.0/scaladocs/index.html.
 
-Python doc is available at http://cloudera.github.io/spark-timeseries/0.1.0/pydoc/py-modindex.html.
+Javadoc is available at http://cloudera.github.io/spark-timeseries/0.2.0/apidocs/index.html.
+
+Python doc is available at http://cloudera.github.io/spark-timeseries/0.2.0/pydoc/py-modindex.html.
 
 The aim here is to provide
 * A set of abstractions for manipulating large time series data sets, similar to
@@ -35,7 +37,7 @@ elements.
 
 The library sits on a few other excellent Java and Scala libraries.
 * [Breeze](https://github.com/scalanlp/breeze) for NumPy-like, BLAS-able linear algebra.
-* [JodaTime](http://www.joda.org/joda-time/) for dates and times. 
+* [java.time](https://docs.oracle.com/javase/8/docs/api/index.html?java/time/package-summary.html) for dates and times. 
 * [Apache Commons Math](https://commons.apache.org/proper/commons-math/) for general math and
   statistics functionality.
 * [Apache Spark](https://spark.apache.org/) for distributed computation with in-memory
@@ -109,7 +111,7 @@ jars:
     
 To run a spark-shell with spark-ts and its dependencies on the classpath:
 
-    spark-shell --jars target/sparkts-0.0.1-jar-with-dependencies.jar
+    spark-shell --jars target/sparkts-$VERSION-jar-with-dependencies.jar
     
 To run Python tests (requires [nose](https://nose.readthedocs.org/en/latest/)):
 
@@ -126,6 +128,9 @@ to as DOCS_REPO.  Then:
     # Build scaladoc
     mvn scala:doc
     
+    # Build javadoc
+    mvn javadoc:javadoc
+
     # Build Python doc
     cd python
     export SPARK_HOME=<location of local Spark installation>
@@ -146,4 +151,13 @@ To build a Python source distribution, first build with Maven, then:
     cp target/sparkts-$VERSION-jar-with-dependencies.jar python/sparkts/
     cd python
     python setup.py sdist
+
+To release Java/Scala packages (based on http://oryxproject.github.io/oryx/docs/how-to-release.html):
+
+    mvn -Darguments="-DskipTests" -DreleaseVersion=$VERSION \
+        -DdevelopmentVersion=$VERSION-SNAPSHOT release:prepare
+
+    mvn -s private-settings.xml -Darguments="-DskipTests" release:perform
+
+
 

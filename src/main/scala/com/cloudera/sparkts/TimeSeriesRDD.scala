@@ -18,24 +18,23 @@ package com.cloudera.sparkts
 import java.io.{BufferedReader, InputStreamReader, PrintStream}
 import java.nio.ByteBuffer
 import java.sql.Timestamp
-import java.util.Arrays
 import java.time._
-import scala.collection.mutable.ArrayBuffer
+import java.util.Arrays
+
+import breeze.linalg.{DenseMatrix => BDM, DenseVector => BDV, diff}
+import com.cloudera.sparkts.MatrixUtil._
 import com.cloudera.sparkts.TimeSeriesUtils._
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
-
 import org.apache.spark._
 import org.apache.spark.mllib.linalg.distributed.{IndexedRow, IndexedRowMatrix, RowMatrix}
-import org.apache.spark.mllib.linalg.{Vectors, DenseVector, DenseMatrix, Vector}
-import breeze.linalg.{diff, DenseMatrix => BDM, Vector => BV, DenseVector => BDV}
+import org.apache.spark.mllib.linalg.{DenseMatrix, DenseVector, Vector, Vectors}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, Row, SQLContext}
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.{DataFrame, Row, SQLContext}
 import org.apache.spark.util.StatCounter
 
-import MatrixUtil._
-
+import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 
 /**
@@ -72,6 +71,31 @@ class TimeSeriesRDD[K](val index: DateTimeIndex, parent: RDD[(K, Vector)])
       }
       new TimeSeries[K](index, mat, labels)
     }
+  }
+
+  /**
+   * Lags each time series in the RDD
+   *
+   * @param maxLag maximum Lag
+   * @param includeOriginals include original time series
+   * @param laggedKey function to generate lagged keys
+   * @tparam U type of keys
+   * @return RDD of lagged time series
+   */
+  def lags[U: ClassTag](maxLag: Int, includeOriginals: Boolean, laggedKey: (K, Int) => U)
+    : TimeSeriesRDD[U] = {
+    val newDateTimeIndex = index.islice(maxLag, index.size)
+
+    val laggedTimeSeriesRDD: RDD[(U, Vector)] = flatMap { t =>
+      val tseries: TimeSeries[K] =
+        new TimeSeries[K](index, new BDM[Double](t._2.length, 1, t._2.toArray), Array[K](t._1))
+      val laggedTseries = tseries.lags(maxLag, includeOriginals, laggedKey)
+      val laggedDataBreeze: BDM[Double] = laggedTseries.data
+      laggedTseries.keys.indices.map { c =>
+        (laggedTseries.keys(c), new DenseVector(laggedDataBreeze(::, c).toArray))
+      }
+    }
+    new TimeSeriesRDD[U](newDateTimeIndex, laggedTimeSeriesRDD)
   }
 
   /**
@@ -214,10 +238,12 @@ class TimeSeriesRDD[K](val index: DateTimeIndex, parent: RDD[(K, Vector)])
    * the time series records in the original RDD. The records are ordered by time.
    */
   def toInstants(nPartitions: Int = -1): RDD[(ZonedDateTime, Vector)] = {
+    // Construct a pre-shuffle RDD where each element is a snippet of a sample, i.e. a set of
+    // observations that all correspond to the same timestamp.  Each key is a tuple of
+    // (date-time loc in date-time index, original partition ID, chunk ID)
     val maxChunkSize = 20
-
     val dividedOnMapSide = mapPartitionsWithIndex { case (partitionId, iter) =>
-      new Iterator[((Int, Int), Vector)] {
+      new Iterator[((Int, Int, Int), Vector)] {
         // Each chunk is a buffer of time series
         var chunk = new ArrayBuffer[Vector]()
         // Current date time.  Gets reset for every chunk.
@@ -225,7 +251,7 @@ class TimeSeriesRDD[K](val index: DateTimeIndex, parent: RDD[(K, Vector)])
         var chunkId: Int = -1
 
         override def hasNext: Boolean = iter.hasNext || dtLoc < index.size
-        override def next(): ((Int, Int), Vector) = {
+        override def next(): ((Int, Int, Int), Vector) = {
           if (chunkId == -1 || dtLoc == index.size) {
             chunk.clear()
             while (chunk.size < maxChunkSize && iter.hasNext) {
@@ -242,42 +268,46 @@ class TimeSeriesRDD[K](val index: DateTimeIndex, parent: RDD[(K, Vector)])
             i += 1
           }
           dtLoc += 1
-          ((dtLoc - 1, partitionId * maxChunkSize + chunkId), new DenseVector(arr))
+          ((dtLoc - 1, partitionId, chunkId), new DenseVector(arr))
         }
       }
     }
 
-    // At this point, dividedOnMapSide is an RDD of snippets of full samples that will be
-    // assembled on the reduce side.  Each key is a tuple of
-    // (date-time, position of snippet in full sample)
-
+    // Carry out a secondary sort.  I.e. repartition the data so that all snippets corresponding
+    // to the same timestamp end up in the same partition, and timestamps are lines up contiguously.
+    val nPart = if (nPartitions == -1) parent.partitions.length else nPartitions
+    val denom = index.size / nPart + (if (index.size % nPart == 0) 0 else 1)
     val partitioner = new Partitioner() {
-      val nPart = if (nPartitions == -1) parent.partitions.length else nPartitions
       override def numPartitions: Int = nPart
-      override def getPartition(key: Any): Int = key.asInstanceOf[(Int, _)]._1 / nPart
+      override def getPartition(key: Any): Int = key.asInstanceOf[(Int, _, _)]._1 / denom
     }
-    implicit val ordering = new Ordering[(Int, Int)] {
-      override def compare(a: (Int, Int), b: (Int, Int)): Int = {
-        val dtDiff = a._1 - b._1
-        if (dtDiff != 0){
-          dtDiff
+    implicit val ordering = new Ordering[(Int, Int, Int)] {
+      override def compare(a: (Int, Int, Int), b: (Int, Int, Int)): Int = {
+        val diff1 = a._1 - b._1
+        if (diff1 != 0) {
+          diff1
         } else {
-          a._2 - b._2
+          val diff2 = a._2 - b._2
+          if (diff2 != 0) {
+            diff2
+          } else {
+            a._3 - b._3
+          }
         }
       }
     }
     val repartitioned = dividedOnMapSide.repartitionAndSortWithinPartitions(partitioner)
-    repartitioned.mapPartitions { iter0: Iterator[((Int, Int), Vector)] =>
+    repartitioned.mapPartitions { iter0: Iterator[((Int, Int, Int), Vector)] =>
       new Iterator[(ZonedDateTime, Vector)] {
         var snipsPerSample = -1
         var elementsPerSample = -1
-        var iter: Iterator[((Int, Int), Vector)] = _
+        var iter: Iterator[((Int, Int, Int), Vector)] = _
 
         // Read the first sample specially so that we know the number of elements and snippets
         // for succeeding samples.
-        def firstSample(): ArrayBuffer[((Int, Int), Vector)] = {
+        def firstSample(): ArrayBuffer[((Int, Int, Int), Vector)] = {
           var snip = iter0.next()
-          val snippets = new ArrayBuffer[((Int, Int), Vector)]()
+          val snippets = new ArrayBuffer[((Int, Int, Int), Vector)]()
           val firstDtLoc = snip._1._1
 
           while (snip != null && snip._1._1 == firstDtLoc) {
@@ -288,13 +318,13 @@ class TimeSeriesRDD[K](val index: DateTimeIndex, parent: RDD[(K, Vector)])
           snippets
         }
 
-        def assembleSnips(snips: Iterator[((Int, Int), Vector)])
+        def assembleSnips(snips: Iterator[((Int, Int, Int), Vector)])
           : (ZonedDateTime, Vector) = {
           val resVec = BDV.zeros[Double](elementsPerSample)
           var dtLoc = -1
           var i = 0
           for (j <- 0 until snipsPerSample) {
-            val ((loc, _), snipVec) = snips.next()
+            val ((loc, _, _), snipVec) = snips.next()
             dtLoc = loc
             resVec(i until i + snipVec.length) := toBreeze(snipVec)
             i += snipVec.length
@@ -340,7 +370,7 @@ class TimeSeriesRDD[K](val index: DateTimeIndex, parent: RDD[(K, Vector)])
       (timestamp, v.toArray)
     }.toDF()
 
-    val dataColExpr = keys.zipWithIndex.map { case (key, i) => s"_2[$i] AS $key" }
+    val dataColExpr = keys.zipWithIndex.map { case (key, i) => s"_2[$i] AS `$key`" }
     val allColsExpr = "_1 AS instant" +: dataColExpr
 
     result.selectExpr(allColsExpr: _*)
@@ -409,7 +439,6 @@ class TimeSeriesRDD[K](val index: DateTimeIndex, parent: RDD[(K, Vector)])
    * of the type of time index.  See
    * [[http://spark.apache.org/docs/latest/mllib-data-types.html]] for more information on the
    * matrix data structure
-   * @param nPartitions
    * @return an equivalent RowMatrix
    */
   def toRowMatrix(nPartitions: Int = -1): RowMatrix = {
@@ -514,10 +543,10 @@ object TimeSeriesRDD {
     }
 
     val shuffled = rdd.repartitionAndSortWithinPartitions(new Partitioner() {
-      val hashPartitioner = new HashPartitioner(rdd.partitions.size)
+      val hashPartitioner = new HashPartitioner(rdd.partitions.length)
       override def numPartitions: Int = hashPartitioner.numPartitions
       override def getPartition(key: Any): Int =
-        hashPartitioner.getPartition(key.asInstanceOf[Tuple2[Any, Any]]._1)
+        hashPartitioner.getPartition(key.asInstanceOf[(Any, Any)]._1)
     })
     new TimeSeriesRDD[String](targetIndex, shuffled.mapPartitions { iter =>
       val bufferedIter = iter.buffered
@@ -530,14 +559,16 @@ object TimeSeriesRDD {
           val series = new Array[Double](targetIndex.size)
           Arrays.fill(series, Double.NaN)
           val first = bufferedIter.next()
-          val firstLoc = targetIndex.locAtDateTime(ZonedDateTime.ofInstant(first._1._2.toInstant, targetIndex.zone))
+          val firstLoc = targetIndex.locAtDateTime(
+            ZonedDateTime.ofInstant(first._1._2.toInstant, targetIndex.zone))
           if (firstLoc >= 0) {
             series(firstLoc) = first._2
           }
           val key = first._1._1
           while (bufferedIter.hasNext && bufferedIter.head._1._1 == key) {
             val sample = bufferedIter.next()
-            val sampleLoc = targetIndex.locAtDateTime(ZonedDateTime.ofInstant(sample._1._2.toInstant, targetIndex.zone))
+            val sampleLoc = targetIndex.locAtDateTime(
+              ZonedDateTime.ofInstant(sample._1._2.toInstant, targetIndex.zone))
             if (sampleLoc >= 0) {
               series(sampleLoc) = sample._2
             }
