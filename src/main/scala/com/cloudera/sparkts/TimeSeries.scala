@@ -172,7 +172,7 @@ class TimeSeries[K](val index: DateTimeIndex, val data: DenseMatrix,
    * TimeSeries will be missing the first n date-times.
    */
   def differences(lag: Int): TimeSeries[K] = {
-    mapSeries(index.islice(lag, index.size), vec => diff(toBreeze(vec).toDenseVector, lag))
+    mapSeries(vec => diff(toBreeze(vec).toDenseVector, lag), index.islice(lag, index.size))
   }
 
   /**
@@ -186,7 +186,7 @@ class TimeSeries[K](val index: DateTimeIndex, val data: DenseMatrix,
    * TimeSeries will be missing the first n date-times.
    */
   def quotients(lag: Int): TimeSeries[K] = {
-    mapSeries(index.islice(lag, index.size), vec => UnivariateTimeSeries.quotients(vec, lag))
+    mapSeries(vec => UnivariateTimeSeries.quotients(vec, lag), index.islice(lag, index.size))
   }
 
   /**
@@ -200,7 +200,7 @@ class TimeSeries[K](val index: DateTimeIndex, val data: DenseMatrix,
    * compounded) returns.
    */
   def price2ret(): TimeSeries[K] = {
-    mapSeries(index.islice(1, index.size), vec => UnivariateTimeSeries.price2ret(vec, 1))
+    mapSeries(vec => UnivariateTimeSeries.price2ret(vec, 1), index.islice(1, index.size))
   }
 
   def univariateSeriesIterator(): Iterator[Vector] = {
@@ -234,7 +234,7 @@ class TimeSeries[K](val index: DateTimeIndex, val data: DenseMatrix,
    * Applies a transformation to each series that preserves the time index.
    */
   def mapSeries(f: (Vector) => Vector): TimeSeries[K] = {
-    mapSeries(index, f)
+    mapSeries(f, index)
   }
 
   /**
@@ -253,7 +253,7 @@ class TimeSeries[K](val index: DateTimeIndex, val data: DenseMatrix,
    * Applies a transformation to each series such that the resulting series align with the given
    * time index.
    */
-  def mapSeries(newIndex: DateTimeIndex, f: (Vector) => Vector): TimeSeries[K] = {
+  def mapSeries(f: (Vector) => Vector, newIndex: DateTimeIndex): TimeSeries[K] = {
     val newSize = newIndex.size
     val newData = new BDM[Double](newSize, data.cols)
     univariateSeriesIterator().zipWithIndex.foreach { case (vec, i) =>
@@ -270,6 +270,40 @@ class TimeSeries[K](val index: DateTimeIndex, val data: DenseMatrix,
    * Gets the first univariate series and its key.
    */
   def head(): (K, Vector) = univariateKeyAndSeriesIterator().next()
+
+  /**
+   * Returns a TimeSeries with each univariate series resampled to a new date-time index. Resampling
+   * provides flexible semantics for specifying which date-times in each input series correspond to
+   * which date-times in the output series, and for aggregating observations when downsampling.
+   *
+   * Based on the closedRight and stampRight parameters, resampling partitions time into non-
+   * overlapping intervals, each corresponding to a date-time in the target index. Each resulting
+   * value in the output series is determined by applying an aggregation function over all the
+   * values that fall within the corresponding window in the input series. If no values in the
+   * input series fall within the window, a NaN is used.
+   *
+   * Compare with the equivalent functionality in Pandas:
+   * http://pandas.pydata.org/pandas-docs/stable/generated/pandas.DataFrame.resample.html
+   *
+   * @param targetIndex The date-time index of the resulting series.
+   * @param aggr Function for aggregating multiple points that fall within a window.
+   * @param closedRight If true, the windows are open on the left and closed on the right. Otherwise
+   *                    the windows are closed on the left and open on the right.
+   * @param stampRight If true, each date-time in the resulting series marks the end of a window.
+   *                   This means that all observations after the end of the last window will be
+   *                   ignored. Otherwise, each date-time in the resulting series marks the start of
+   *                   a window. This means that all observations after the end of the last window
+   *                   will be ignored.
+   * @return The values of the resampled series.
+   */
+
+  def resample(
+      targetIndex: DateTimeIndex,
+      aggr: (Array[Double], Int, Int) => Double,
+      closedRight: Boolean,
+      stampRight: Boolean): TimeSeries[K] = {
+    mapSeries(Resample.resample(_, index, targetIndex, aggr, closedRight, stampRight), targetIndex)
+  }
 }
 
 object TimeSeries {

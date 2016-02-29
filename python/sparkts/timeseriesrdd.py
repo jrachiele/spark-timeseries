@@ -26,7 +26,7 @@ class TimeSeriesRDD(RDD):
             jvm = rdd.ctx._jvm
             jrdd = rdd._reserialize(_TimeSeriesSerializer())._jrdd.mapToPair( \
                 jvm.com.cloudera.sparkts.BytesToKeyAndSeries())
-            self._jtsrdd = jvm.com.cloudera.sparkts.api.java.JavaTimeSeriesRDDFactory.javaTimeSeriesRDD( \
+            self._jtsrdd = jvm.com.cloudera.sparkts.api.java.JavaTimeSeriesRDDFactory.timeSeriesRDD( \
                 dt_index._jdt_index, jrdd)
             RDD.__init__(self, rdd._jrdd, rdd.ctx)
         else:
@@ -198,7 +198,7 @@ class TimeSeriesRDD(RDD):
         """
         return TimeSeriesRDD(None, None, self._jtsrdd.withIndex(new_index._jdt_index), self.ctx)
 
-def time_series_rdd_from_pandas_series_rdd(series_rdd, sc):
+def time_series_rdd_from_pandas_series_rdd(series_rdd):
     """
     Instantiates a TimeSeriesRDD from an RDD of Pandas Series objects.
 
@@ -210,7 +210,7 @@ def time_series_rdd_from_pandas_series_rdd(series_rdd, sc):
     sc : SparkContext
     """
     first = series_rdd.first()
-    dt_index = irregular(first[1].index, sc)
+    dt_index = irregular(first[1].index, series_rdd.ctx)
     return TimeSeriesRDD(dt_index, series_rdd.mapValues(lambda x: x.values))
 
 def time_series_rdd_from_observations(dt_index, df, ts_col, key_col, val_col):
@@ -232,7 +232,7 @@ def time_series_rdd_from_observations(dt_index, df, ts_col, key_col, val_col):
         The name of the column in the DataFrame containing the values.
     """
     jvm = df._sc._jvm
-    jtsrdd = jvm.com.cloudera.sparkts.api.java.JavaTimeSeriesRDDFactory.javaTimeSeriesRDDFromObservations( \
+    jtsrdd = jvm.com.cloudera.sparkts.api.java.JavaTimeSeriesRDDFactory.timeSeriesRDDFromObservations( \
       dt_index._jdt_index, df._jdf, ts_col, key_col, val_col)
     return TimeSeriesRDD(None, None, jtsrdd, df._sc)
 
